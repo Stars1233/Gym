@@ -1,1 +1,1 @@
-# NeMo Gym
+# NeMo-Gym
