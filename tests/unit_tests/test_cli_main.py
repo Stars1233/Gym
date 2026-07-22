@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import os
 import sys
 import types
 
@@ -21,9 +22,17 @@ from pytest import MonkeyPatch
 
 import nemo_gym.cli.main as cli_main
 import nemo_gym.global_config as gc
-from nemo_gym import WORKING_DIR
+from nemo_gym import NEMO_GYM_EXTRA_ROOTS_ENV_VAR_NAME, WORKING_DIR
 from nemo_gym.cli.main import main
 from nemo_gym.global_config import NEMO_GYM_CONFIG_DICT_ENV_VAR_NAME
+
+
+@pytest.fixture(autouse=True)
+def _isolate_extra_roots_env(monkeypatch: MonkeyPatch):
+    # `main()` folds `--search-dir` into NEMO_GYM_EXTRA_ROOTS by mutating os.environ directly; delenv gives
+    # each test a clean baseline and restores the original on teardown (even after main() reassigns the key),
+    # so the roots never leak between tests.
+    monkeypatch.delenv(NEMO_GYM_EXTRA_ROOTS_ENV_VAR_NAME, raising=False)
 
 
 def _dispatch_for(monkeypatch: MonkeyPatch, argv: list[str]) -> tuple[str, list[str]]:
@@ -1003,19 +1012,17 @@ class TestSearchDir:
         )
         assert overrides == [f"+config_paths=[{WORKING_DIR / 'benchmarks/gsm8k/config.yaml'}]"]
 
-    def test_ambiguous_match_errors(self, monkeypatch: MonkeyPatch, tmp_path, capsys) -> None:
-        # A built-in name also present in a --search-dir is ambiguous; the user must disambiguate with --config.
+    def test_collision_prefers_search_dir_and_warns(self, monkeypatch: MonkeyPatch, tmp_path, caplog) -> None:
+        # A built-in name also present in a --search-dir resolves to the higher-priority --search-dir copy
+        # (matching `gym list`'s earlier-root-wins rule), with a warning about the shadowed built-in.
         self._make_user_benchmark(tmp_path, name="gsm8k")  # gsm8k also exists under WORKING_DIR
-        monkeypatch.setattr(cli_main, "dispatch", lambda target, overrides: None)
-        monkeypatch.setattr(
-            sys, "argv", ["gym", "eval", "prepare", "--benchmark", "gsm8k", "--search-dir", str(tmp_path)]
-        )
-        with pytest.raises(SystemExit):
-            main()
-        err = capsys.readouterr().err
-        assert "ambiguous" in err
-        assert str(WORKING_DIR / "benchmarks" / "gsm8k" / "config.yaml") in err
-        assert str(tmp_path / "benchmarks" / "gsm8k" / "config.yaml") in err
+        with caplog.at_level(logging.WARNING):
+            _, overrides = _dispatch_for(
+                monkeypatch, ["eval", "prepare", "--benchmark", "gsm8k", "--search-dir", str(tmp_path)]
+            )
+        assert overrides == [f"+config_paths=[{tmp_path / 'benchmarks' / 'gsm8k' / 'config.yaml'}]"]
+        assert "matches multiple configs" in caplog.text
+        assert str(WORKING_DIR / "benchmarks" / "gsm8k" / "config.yaml") in caplog.text
 
     def test_search_dir_alone_emits_nothing(self, monkeypatch: MonkeyPatch, tmp_path) -> None:
         # --search-dir is consumed by the selectors; on its own it is not a Hydra override.
@@ -1053,8 +1060,8 @@ class TestInstallRootResolution:
         install_root.mkdir()
         user_cwd.mkdir()
         self._make_resources_server(install_root)  # built-in only under the install root
-        monkeypatch.setattr(cli_main, "PARENT_DIR", install_root)
-        monkeypatch.setattr(cli_main, "WORKING_DIR", user_cwd)
+        monkeypatch.setattr("nemo_gym.PARENT_DIR", install_root)
+        monkeypatch.setattr("nemo_gym.WORKING_DIR", user_cwd)
         monkeypatch.chdir(user_cwd)
 
         resolved = cli_main._asset_config_path("resources-server", "foo")
@@ -1066,27 +1073,29 @@ class TestInstallRootResolution:
         install_root.mkdir()
         user_cwd.mkdir()
         self._make_resources_server(user_cwd, name="myenv")  # exists only in the user's project
-        monkeypatch.setattr(cli_main, "PARENT_DIR", install_root)
-        monkeypatch.setattr(cli_main, "WORKING_DIR", user_cwd)
+        monkeypatch.setattr("nemo_gym.PARENT_DIR", install_root)
+        monkeypatch.setattr("nemo_gym.WORKING_DIR", user_cwd)
         monkeypatch.chdir(user_cwd)
 
         resolved = cli_main._asset_config_path("resources-server", "myenv")
         assert resolved == str(user_cwd / "resources_servers" / "myenv" / "configs" / "myenv.yaml")
 
-    def test_same_name_in_install_root_and_cwd_is_ambiguous(self, monkeypatch: MonkeyPatch, tmp_path) -> None:
-        # A user asset shadowing a built-in of the same name is ambiguous; they must disambiguate with --config.
+    def test_same_name_in_install_root_and_cwd_prefers_cwd(self, monkeypatch: MonkeyPatch, tmp_path, caplog) -> None:
+        # A user asset in cwd shadows a built-in of the same name (cwd outranks the install root), with a warning.
         install_root = tmp_path / "site-packages"
         user_cwd = tmp_path / "my-project"
         install_root.mkdir()
         user_cwd.mkdir()
         self._make_resources_server(install_root)
         self._make_resources_server(user_cwd)
-        monkeypatch.setattr(cli_main, "PARENT_DIR", install_root)
-        monkeypatch.setattr(cli_main, "WORKING_DIR", user_cwd)
+        monkeypatch.setattr("nemo_gym.PARENT_DIR", install_root)
+        monkeypatch.setattr("nemo_gym.WORKING_DIR", user_cwd)
         monkeypatch.chdir(user_cwd)
 
-        with pytest.raises(ValueError, match="ambiguous"):
-            cli_main._asset_config_path("resources-server", "foo")
+        with caplog.at_level(logging.WARNING):
+            resolved = cli_main._asset_config_path("resources-server", "foo")
+        assert resolved == str(user_cwd / "resources_servers" / "foo" / "configs" / "foo.yaml")
+        assert "matches multiple configs" in caplog.text
 
     def test_editable_layout_single_root_not_self_ambiguous(self, monkeypatch: MonkeyPatch, tmp_path) -> None:
         # Editable install: PARENT_DIR == WORKING_DIR == cwd. The same file found via all three roots
@@ -1094,8 +1103,8 @@ class TestInstallRootResolution:
         repo_root = tmp_path / "Gym"
         repo_root.mkdir()
         self._make_resources_server(repo_root)
-        monkeypatch.setattr(cli_main, "PARENT_DIR", repo_root)
-        monkeypatch.setattr(cli_main, "WORKING_DIR", repo_root)
+        monkeypatch.setattr("nemo_gym.PARENT_DIR", repo_root)
+        monkeypatch.setattr("nemo_gym.WORKING_DIR", repo_root)
         monkeypatch.chdir(repo_root)
 
         resolved = cli_main._asset_config_path("resources-server", "foo")
@@ -1112,3 +1121,36 @@ class TestListEnvironmentsRouting:
         target, overrides = _dispatch_for(monkeypatch, ["list", "environments", "--json"])
         assert target == "nemo_gym.cli.env:list_environments"
         assert overrides == ["+json=true"]
+
+    def test_search_dir_populates_extra_roots_env_during_command_then_restores(self, monkeypatch: MonkeyPatch) -> None:
+        # `--search-dir` (repeatable) is folded into NEMO_GYM_EXTRA_ROOTS for the duration of the command (no
+        # Hydra override) so the roots reach every resolver, then restored so main() leaves no global state.
+        seen = {}
+
+        def fake_dispatch(target: str, overrides: list[str]) -> None:
+            seen["overrides"] = overrides
+            seen["env"] = os.environ.get(NEMO_GYM_EXTRA_ROOTS_ENV_VAR_NAME)
+
+        monkeypatch.setattr(cli_main, "dispatch", fake_dispatch)
+        monkeypatch.setattr(sys, "argv", ["gym", "list", "environments", "--search-dir", "/a", "--search-dir", "/b"])
+        main()
+
+        assert seen["overrides"] == []
+        assert seen["env"] == os.pathsep.join(["/a", "/b"])  # set while the command runs
+        assert NEMO_GYM_EXTRA_ROOTS_ENV_VAR_NAME not in os.environ  # restored (unset) after main()
+
+    def test_search_dir_prepends_to_pre_existing_extra_roots_env(self, monkeypatch: MonkeyPatch) -> None:
+        # --search-dir roots take priority over a pre-existing NEMO_GYM_EXTRA_ROOTS (both searched), then restore.
+        monkeypatch.setenv(NEMO_GYM_EXTRA_ROOTS_ENV_VAR_NAME, "/pre")
+        seen = {}
+
+        def fake_dispatch(target: str, overrides: list[str]) -> None:
+            seen["env"] = os.environ.get(NEMO_GYM_EXTRA_ROOTS_ENV_VAR_NAME)
+
+        monkeypatch.setattr(cli_main, "dispatch", fake_dispatch)
+        monkeypatch.setattr(sys, "argv", ["gym", "list", "environments", "--search-dir", "/a", "--search-dir", "/b"])
+        main()
+
+        # --search-dir roots come first, existing extra roots after, so both stay searchable
+        assert seen["env"] == os.pathsep.join(["/a", "/b", "/pre"])
+        assert os.environ[NEMO_GYM_EXTRA_ROOTS_ENV_VAR_NAME] == "/pre"  # original restored after main()
